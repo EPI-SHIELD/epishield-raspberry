@@ -2,30 +2,29 @@ import cv2
 import os
 import time
 from dotenv import load_dotenv
-from gpiozero import OutputDevice
+from gpiozero import Servo
 from edge_impulse_linux.image import ImageImpulseRunner
 
-# Carrega variáveis do arquivo .env
+# Carrega variáveis
 load_dotenv()
-
-# Configurações do ambiente
 MODEL_PATH = os.getenv("MODEL_PATH", "./modelo.eim")
 GPIO_PIN = int(os.getenv("GPIO_PIN", 17))
 THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.8))
-TARGET_LABEL = os.getenv("TARGET_LABEL", "autorizado")
+TARGET_LABEL = os.getenv("TARGET_LABEL", "vest") 
 OPEN_TIME = float(os.getenv("OPEN_DURATION", 3.0))
 CAMERA_ID = int(os.getenv("CAMERA_ID", 0))
 
-# Inicializa o pino da catraca
-# Ajuste active_high para False se o seu módulo relé for ativado em nível baixo (GND)
-catraca = OutputDevice(GPIO_PIN, active_high=True, initial_value=False)
+# Configuração dos limites do Servo Motor (valores de -1.0 a 1.0)
+SERVO_OPEN = float(os.getenv("SERVO_OPEN_VALUE", 1.0))
+SERVO_CLOSE = float(os.getenv("SERVO_CLOSE_VALUE", -1.0))
 
-def abrir_catraca():
-    print("Acesso liberado. Abrindo catraca...")
-    catraca.on()
-    time.sleep(OPEN_TIME)
-    catraca.off()
-    print("Catraca fechada.")
+# Inicializa o pino do servo
+catraca_servo = Servo(GPIO_PIN)
+
+def mover_servo(valor_posicao):
+    catraca_servo.value = valor_posicao
+    time.sleep(0.5) # Dá meio segundo para a mecânica do motor girar fisicamente
+    catraca_servo.value = None # Desliga o sinal PWM para o motor não ficar "tremendo"
 
 def main():
     if not os.path.exists(MODEL_PATH):
@@ -34,32 +33,60 @@ def main():
 
     runner = ImageImpulseRunner(MODEL_PATH)
     
+    # Garante que a catraca comece fisicamente travada ao rodar o script
+    mover_servo(SERVO_CLOSE)
+    catraca_aberta = False
+    ultimo_momento_visto = 0.0
+    
     try:
         model_info = runner.init()
         print(f"Modelo carregado: {model_info['project']['owner']} / {model_info['project']['name']}")
+        print("Iniciando monitoramento da câmera. Pressione Ctrl+C para encerrar.")
         
-        # Loop de inferência contínua usando a câmera
+        # O loop roda infinitamente
         for res, img in runner.classifier(CAMERA_ID):
+            vest_detectada = False
             
-            # Para modelos de Classificação de Imagem
-            if "classification" in res["result"]:
-                predictions = res["result"]["classification"]
-                if TARGET_LABEL in predictions and predictions[TARGET_LABEL] >= THRESHOLD:
-                    print(f"Confiança ({TARGET_LABEL}): {predictions[TARGET_LABEL]:.2f}")
-                    abrir_catraca()
-                    time.sleep(1) # Delay de segurança
-                    
-            # Para modelos de Detecção de Objetos (Bounding Boxes)
-            elif "bounding_boxes" in res["result"]:
+            # Verifica detecção de objetos (Bounding Boxes)
+            if "bounding_boxes" in res["result"]:
                 for bb in res["result"]["bounding_boxes"]:
                     if bb["label"] == TARGET_LABEL and bb["value"] >= THRESHOLD:
-                        print(f"Confiança ({bb['label']}): {bb['value']:.2f}")
-                        abrir_catraca()
-                        time.sleep(1)
+                        vest_detectada = True
+                        break 
+                        
+            # Verifica classificação de imagem completa
+            elif "classification" in res["result"]:
+                predictions = res["result"]["classification"]
+                if TARGET_LABEL in predictions and predictions[TARGET_LABEL] >= THRESHOLD:
+                    vest_detectada = True
+
+            tempo_atual = time.time()
+
+            # LÓGICA DE ABERTURA E FECHAMENTO
+            if vest_detectada:
+                ultimo_momento_visto = tempo_atual 
+                
+                if not catraca_aberta:
+                    print(f"[{TARGET_LABEL}] detectado! Abrindo catraca (Servo)...")
+                    mover_servo(SERVO_OPEN)
+                    catraca_aberta = True
+                    
+            else:
+                if catraca_aberta:
+                    tempo_sem_ver = tempo_atual - ultimo_momento_visto
+                    
+                    if tempo_sem_ver >= OPEN_TIME:
+                        print(f"[{TARGET_LABEL}] ausente por {OPEN_TIME}s. Fechando catraca (Servo)...")
+                        mover_servo(SERVO_CLOSE)
+                        catraca_aberta = False
 
     finally:
         if runner:
             runner.stop()
+        
+        # Garante a segurança: trava a catraca antes do script fechar
+        mover_servo(SERVO_CLOSE)
+        print("\nSistema encerrado. Catraca travada.")
 
 if __name__ == "__main__":
     main()
